@@ -43,6 +43,7 @@ from nerfstudio.model_components.losses import (
     MSELoss,
     MultiViewLoss,
     ScaleAndShiftInvariantLoss,
+    SensorDepthLoss,
     compute_scale_and_shift,
     monosdf_normal_loss,
 )
@@ -97,6 +98,14 @@ class SurfaceModelConfig(ModelConfig):
     """Threshold for minimal patch variance"""
     topk: int = 4
     """Number of minimal patch consistency selected for training"""
+    sensor_depth_truncation: float = 0.015
+    """Sensor depth trunction, default value is 0.015 which means 5cm with a rough scale value 0.3 (0.015 = 0.05 * 0.3)"""
+    sensor_depth_l1_loss_mult: float = 0.0
+    """Sensor depth L1 loss multiplier."""
+    sensor_depth_freespace_loss_mult: float = 0.0
+    """Sensor depth free space loss multiplier."""
+    sensor_depth_sdf_loss_mult: float = 0.0
+    """Sensor depth sdf loss multiplier."""
     sdf_field: SDFFieldConfig = SDFFieldConfig()
     """Config for SDF Field"""
     background_model: Literal["grid", "mlp", "none"] = "mlp"
@@ -197,6 +206,7 @@ class SurfaceModel(Model):
         self.patch_loss = MultiViewLoss(
             patch_size=self.config.patch_size, topk=self.config.topk, min_patch_variance=self.config.min_patch_variance
         )
+        self.sensor_depth_loss = SensorDepthLoss(truncation=self.config.sensor_depth_truncation)
 
         # metrics
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
@@ -274,7 +284,14 @@ class SurfaceModel(Model):
         else:
             bg_outputs = {}
 
-        outputs = {"rgb": rgb, "accumulation": accumulation, "depth": depth, "normal": normal, "weights": weights}
+        outputs = {
+            "rgb": rgb,
+            "accumulation": accumulation,
+            "depth": depth,
+            "normal": normal,
+            "weights": weights,
+            "directions_norm": ray_bundle.directions_norm,  # used to scale z_vals for free space and sdf loss
+        }
         outputs.update(bg_outputs)
 
         if self.training:
@@ -370,6 +387,18 @@ class SurfaceModel(Model):
                     * self.config.mono_depth_loss_mult
                 )
 
+            # sensor depth loss
+            if "sensor_depth" in batch and (
+                self.config.sensor_depth_l1_loss_mult > 0.0
+                or self.config.sensor_depth_freespace_loss_mult > 0.0
+                or self.config.sensor_depth_sdf_loss_mult > 0.0
+            ):
+                l1_loss, free_space_loss, sdf_loss = self.sensor_depth_loss(batch, outputs)
+
+                loss_dict["sensor_l1_loss"] = l1_loss * self.config.sensor_depth_l1_loss_mult
+                loss_dict["sensor_freespace_loss"] = free_space_loss * self.config.sensor_depth_freespace_loss_mult
+                loss_dict["sensor_sdf_loss"] = sdf_loss * self.config.sensor_depth_sdf_loss_mult
+
             # multi-view photoconsistency loss as Geo-NeuS
             if "patches" in outputs and self.config.patch_warp_loss_mult > 0.0:
                 patches = outputs["patches"]
@@ -417,7 +446,7 @@ class SurfaceModel(Model):
             )
             depth_pred = depth_pred * scale + shift
 
-            combined_depth = torch.cat([depth_pred, depth_gt[..., None]], dim=1)
+            combined_depth = torch.cat([depth_gt[..., None], depth_pred], dim=1)
             combined_depth = colormaps.apply_depth_colormap(combined_depth)
         else:
             depth = colormaps.apply_depth_colormap(
@@ -428,9 +457,24 @@ class SurfaceModel(Model):
 
         if "normal" in batch:
             normal_gt = (batch["normal"].to(self.device) + 1.0) / 2.0
-            combined_normal = torch.cat([normal, normal_gt], dim=1)
+            combined_normal = torch.cat([normal_gt, normal], dim=1)
         else:
             combined_normal = torch.cat([normal], dim=1)
+
+        images_dict = {
+            "img": combined_rgb,
+            "accumulation": combined_acc,
+            "depth": combined_depth,
+            "normal": combined_normal,
+        }
+
+        if "sensor_depth" in batch:
+            sensor_depth = batch["sensor_depth"]
+            depth_pred = outputs["depth"]
+
+            combined_sensor_depth = torch.cat([sensor_depth[..., None], depth_pred], dim=1)
+            combined_sensor_depth = colormaps.apply_depth_colormap(combined_sensor_depth)
+            images_dict["sensor_depth"] = combined_sensor_depth
 
         # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
         image = torch.moveaxis(image, -1, 0)[None, ...]
@@ -443,12 +487,5 @@ class SurfaceModel(Model):
         # all of these metrics will be logged as scalars
         metrics_dict = {"psnr": float(psnr.item()), "ssim": float(ssim)}  # type: ignore
         metrics_dict["lpips"] = float(lpips)
-
-        images_dict = {
-            "img": combined_rgb,
-            "accumulation": combined_acc,
-            "depth": combined_depth,
-            "normal": combined_normal,
-        }
 
         return metrics_dict, images_dict
