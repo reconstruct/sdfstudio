@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
+from tqdm import tqdm
 
 parser = argparse.ArgumentParser(description="Visualize output for depth or surface normals")
 
@@ -63,7 +64,7 @@ if args.task == "normal":
     # else:
     #     state_dict = checkpoint
 
-    pretrained_weights_path = root_dir + "omnidata_dpt_normal_v2.ckpt"
+    pretrained_weights_path = os.path.join(root_dir, "omnidata_dpt_normal_v2.ckpt")
     model = DPTDepthModel(backbone="vitb_rn50_384", num_channels=3)  # DPT Hybrid
     checkpoint = torch.load(pretrained_weights_path, map_location=map_location)
     if "state_dict" in checkpoint:
@@ -85,7 +86,7 @@ if args.task == "normal":
 
 elif args.task == "depth":
     image_size = 384
-    pretrained_weights_path = root_dir + "omnidata_dpt_depth_v2.ckpt"  # 'omnidata_dpt_depth_v1.ckpt'
+    pretrained_weights_path = os.path.join(root_dir, "omnidata_dpt_depth_v2.ckpt")  # 'omnidata_dpt_depth_v1.ckpt'
     # model = DPTDepthModel(backbone='vitl16_384') # DPT Large
     model = DPTDepthModel(backbone="vitb_rn50_384")  # DPT Hybrid
     checkpoint = torch.load(pretrained_weights_path, map_location=map_location)
@@ -127,7 +128,7 @@ def standardize_depth_map(img, mask_valid=None, trunc_value=0.1):
     if num_nan > 0:
         sorted_img = sorted_img[:-num_nan]
     # Remove outliers
-    trunc_img = sorted_img[int(trunc_value * len(sorted_img)) : int((1 - trunc_value) * len(sorted_img))]
+    trunc_img = sorted_img[int(trunc_value * len(sorted_img)):int((1 - trunc_value) * len(sorted_img))]
     trunc_mean = trunc_img.mean()
     trunc_var = trunc_img.var()
     eps = 1e-6
@@ -141,8 +142,12 @@ def standardize_depth_map(img, mask_valid=None, trunc_value=0.1):
 def save_outputs(img_path, output_file_name):
     with torch.no_grad():
         save_path = os.path.join(args.output_path, output_file_name.replace("_rgb", f"_{args.task}") + ".png")
-        print(f"Reading input {img_path} ...")
+        # print(f"Reading input {img_path} ...")
         img = Image.open(img_path)
+        H, W = img.size[1], img.size[0]
+        assert H == W, "Image should be square"
+        assert H % 384 == 0, "Image size should be divisible by 384"
+        scale_factor = H // 384
 
         img_tensor = trans_totensor(img)[:3].unsqueeze(0).to(device)
 
@@ -152,23 +157,26 @@ def save_outputs(img_path, output_file_name):
         output = model(img_tensor).clamp(min=0, max=1)
 
         if args.task == "depth":
-            # output = F.interpolate(output.unsqueeze(0), (512, 512), mode='bicubic').squeeze(0)
+            if scale_factor > 1:
+                output = F.interpolate(output.unsqueeze(0), scale_factor=scale_factor, mode="nearest").squeeze(0)
             output = output.clamp(0, 1)
 
             np.save(save_path.replace(".png", ".npy"), output.detach().cpu().numpy()[0])
             plt.imsave(save_path, output.detach().cpu().squeeze(), cmap="viridis")
         else:
+            if scale_factor > 1:
+                output = torch.nn.functional.interpolate(output, scale_factor=scale_factor, mode="nearest")
             np.save(save_path.replace(".png", ".npy"), output.detach().cpu().numpy()[0])
             trans_topil(output[0]).save(save_path)
 
-        print(f"Writing output {save_path} ...")
+        # print(f"Writing output {save_path} ...")
 
 
 img_path = Path(args.img_path)
 if img_path.is_file():
     save_outputs(args.img_path, os.path.splitext(os.path.basename(args.img_path))[0])
 elif img_path.is_dir():
-    for f in glob.glob(args.img_path + "/*_rgb.png"):
+    for f in tqdm(glob.glob(args.img_path + "/*_rgb.png")):
         save_outputs(f, os.path.splitext(os.path.basename(f))[0])
 else:
     print("invalid file path!")
